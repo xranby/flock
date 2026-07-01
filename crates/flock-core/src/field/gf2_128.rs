@@ -96,7 +96,15 @@ impl Mul for F128 {
             // SAFETY: aes target feature is enabled at compile time.
             unsafe { aarch64::ghash_mul_binius(self, rhs) }
         }
-        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+        #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+        {
+            // SAFETY: pclmulqdq target feature is enabled at compile time.
+            unsafe { x86_64::ghash_mul_binius(self, rhs) }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq")
+        )))]
         {
             software::ghash_mul(self, rhs)
         }
@@ -488,6 +496,109 @@ pub mod aarch64 {
 }
 
 // ---------------------------------------------------------------------------
+// x86_64 + PCLMULQDQ: CLMUL-based multiplication variants. Mirrors the aarch64
+// PMULL path one-to-one; _mm_clmulepi64_si128 is the direct analogue of PMULL
+// (one 64×64 carry-less multiply per instruction). Added by x86 port.
+// ---------------------------------------------------------------------------
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod x86_64 {
+    use super::{F128, F256Unreduced};
+    use core::arch::x86_64::*;
+
+    /// GHASH reduction constant: x^128 ≡ x^7 + x^2 + x + 1 (0x87), in lane 0.
+    #[inline(always)]
+    unsafe fn poly() -> __m128i {
+        unsafe { _mm_set_epi64x(0, 0x87) }
+    }
+
+    #[inline(always)]
+    pub(crate) unsafe fn to_m128(a: F128) -> __m128i {
+        unsafe { _mm_set_epi64x(a.hi as i64, a.lo as i64) }
+    }
+
+    /// SSE2-only extraction (no SSE4.1 `pextrq` requirement).
+    #[inline(always)]
+    pub(crate) unsafe fn from_m128(v: __m128i) -> F128 {
+        unsafe {
+            F128 {
+                lo: _mm_cvtsi128_si64(v) as u64,
+                hi: _mm_cvtsi128_si64(_mm_unpackhi_epi64(v, v)) as u64,
+            }
+        }
+    }
+
+    /// Karatsuba 128x128 carry-less multiply into the three-part form
+    /// t0 + t1*x^64 + t2*x^128 (3 CLMUL instead of 4-mul schoolbook).
+    /// Halves are picked with CLMUL's immediate selector; nothing leaves
+    /// the vector registers.
+    #[inline(always)]
+    unsafe fn clmul_3part(va: __m128i, vb: __m128i) -> (__m128i, __m128i, __m128i) {
+        unsafe {
+            let t0 = _mm_clmulepi64_si128(va, vb, 0x00); // a.lo * b.lo
+            let t2 = _mm_clmulepi64_si128(va, vb, 0x11); // a.hi * b.hi
+            let amix = _mm_xor_si128(va, _mm_shuffle_epi32(va, 0x4E)); // both lanes = a.lo^a.hi
+            let bmix = _mm_xor_si128(vb, _mm_shuffle_epi32(vb, 0x4E));
+            let tm = _mm_clmulepi64_si128(amix, bmix, 0x00); // (a.lo^a.hi)(b.lo^b.hi)
+            let t1 = _mm_xor_si128(_mm_xor_si128(tm, t0), t2); // cross terms
+            (t0, t1, t2)
+        }
+    }
+
+    /// Two-stage GHASH reduction of the three-part product, identical dataflow
+    /// to the NEON `ghash_mul_binius` (fold t2 into t1, then t1 into t0), with
+    /// the by-0x87 folds done via CLMUL half-selectors (2 CLMUL, no extracts).
+    #[inline(always)]
+    unsafe fn reduce_3part(t0: __m128i, t1: __m128i, t2: __m128i) -> __m128i {
+        unsafe {
+            let p = poly();
+            // t1 ^= (t2.lo << 64) ^ (t2.hi * 0x87)
+            let mut t1 = _mm_xor_si128(t1, _mm_slli_si128(t2, 8));
+            t1 = _mm_xor_si128(t1, _mm_clmulepi64_si128(t2, p, 0x01));
+            // t0 ^= (t1.lo << 64) ^ (t1.hi * 0x87)
+            let mut t0 = _mm_xor_si128(t0, _mm_slli_si128(t1, 8));
+            t0 = _mm_xor_si128(t0, _mm_clmulepi64_si128(t1, p, 0x01));
+            t0
+        }
+    }
+
+    /// Vector-native GHASH multiply for hot loops that already hold values in
+    /// `__m128i` (e.g. the zerocheck convert-table fold): 5 CLMUL total, no
+    /// GPR round-trips.
+    #[inline(always)]
+    pub(crate) unsafe fn mul_m128(va: __m128i, vb: __m128i) -> __m128i {
+        unsafe {
+            let (t0, t1, t2) = clmul_3part(va, vb);
+            reduce_3part(t0, t1, t2)
+        }
+    }
+
+    /// GHASH multiply on `F128` values (dispatch target for `Mul`).
+    #[inline]
+    pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
+        unsafe { from_m128(mul_m128(to_m128(a), to_m128(b))) }
+    }
+
+    /// Full 256-bit carry-less product, no reduction.
+    #[inline]
+    pub unsafe fn ghash_mul_unreduced_x86(a: F128, b: F128) -> F256Unreduced {
+        unsafe {
+            let (t0, t1, t2) = clmul_3part(to_m128(a), to_m128(b));
+            // lo128 = t0 ^ (t1 << 64), hi128 = t2 ^ (t1 >> 64)
+            let lo = _mm_xor_si128(t0, _mm_slli_si128(t1, 8));
+            let hi = _mm_xor_si128(t2, _mm_srli_si128(t1, 8));
+            let lof = from_m128(lo);
+            let hif = from_m128(hi);
+            F256Unreduced {
+                r0: lof.lo,
+                r1: lof.hi,
+                r2: hif.lo,
+                r3: hif.hi,
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Software fallback: bit-by-bit clmul64. Slow but portable; also the reference
 // the NEON path is checked against in tests.
 // ---------------------------------------------------------------------------
@@ -540,7 +651,15 @@ fn ghash_mul_unreduced(a: F128, b: F128) -> F256Unreduced {
         // SAFETY: aes target feature is enabled at compile time.
         unsafe { aarch64::ghash_mul_unreduced_neon(a, b) }
     }
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+    {
+        // SAFETY: pclmulqdq target feature is enabled at compile time.
+        unsafe { x86_64::ghash_mul_unreduced_x86(a, b) }
+    }
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq")
+    )))]
     {
         software::ghash_mul_unreduced(a, b)
     }

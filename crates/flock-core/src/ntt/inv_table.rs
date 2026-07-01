@@ -114,6 +114,20 @@ impl InvNttTableByteSingleGf8 {
             unsafe { self.apply_neon_unchecked(bytes, out) };
             return;
         }
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+        if self.ell == 64 {
+            // SAFETY: avx512f statically enabled via target-cpu=native;
+            // ell == 64; method validates slice lengths.
+            unsafe { self.apply_avx512_unchecked(bytes, out) };
+            return;
+        }
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if self.ell >= 32 && self.ell % 32 == 0 {
+            // SAFETY: avx2 statically enabled via target-cpu=native; ell is a
+            // multiple of 32; method validates slice lengths.
+            unsafe { self.apply_avx2_unchecked(bytes, out) };
+            return;
+        }
         self.apply_scalar(bytes, out);
     }
 
@@ -184,6 +198,102 @@ impl InvNttTableByteSingleGf8 {
                     }
                 }
             }
+        }
+    }
+
+    /// AVX2 variant of `apply` — uniform 32-byte chunks. The NEON path's
+    /// per-16-byte-chunk permutation (index XOR `c ^ b_high` plus a 64-bit
+    /// half-swap for odd `b`) is expressed as: 32-byte block index XOR
+    /// `b_high >> 1`, plus one `vpermq` whose immediate encodes the two
+    /// possible swaps ((b_high & 1) swaps the 16-byte halves of the block,
+    /// (b & 1) swaps the 8-byte halves within each 16-byte chunk).
+    ///
+    /// # Safety
+    /// Caller must be on x86_64 with AVX2. Validates slice lengths;
+    /// requires `ell % 32 == 0`.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    pub unsafe fn apply_avx2_unchecked(&self, bytes: &[u8], out: &mut [F8]) {
+        use core::arch::x86_64::*;
+        assert_eq!(bytes.len(), self.n_chunks);
+        assert_eq!(out.len(), self.ell);
+        debug_assert_eq!(self.ell % 32, 0);
+        let n_blk = self.ell / 32;
+        let base = self.data.as_ptr() as *const u8;
+        let out_ptr = out.as_mut_ptr() as *mut u8;
+
+        unsafe {
+            let row0 = base.add(bytes[0] as usize * self.ell);
+            for blk in 0..n_blk {
+                let v = _mm256_loadu_si256(row0.add(blk * 32) as *const __m256i);
+                _mm256_storeu_si256(out_ptr.add(blk * 32) as *mut __m256i, v);
+            }
+
+            macro_rules! accumulate {
+                ($row:expr, $blk_x:expr, $perm:expr) => {
+                    for blk in 0..n_blk {
+                        let src = $row.add((blk ^ $blk_x) * 32) as *const __m256i;
+                        let v = $perm(_mm256_loadu_si256(src));
+                        let dst = out_ptr.add(blk * 32) as *mut __m256i;
+                        _mm256_storeu_si256(dst, _mm256_xor_si256(_mm256_loadu_si256(dst), v));
+                    }
+                };
+            }
+
+            for b in 1..self.n_chunks {
+                let b_high = b >> 1;
+                let row_b = base.add(bytes[b] as usize * self.ell);
+                let blk_x = b_high >> 1;
+                match ((b_high & 1) != 0, (b & 1) != 0) {
+                    // qword orders: identity / [1,0,3,2] / [2,3,0,1] / [3,2,1,0]
+                    (false, false) => accumulate!(row_b, blk_x, |v| v),
+                    (false, true) => {
+                        accumulate!(row_b, blk_x, |v| _mm256_permute4x64_epi64::<0xB1>(v))
+                    }
+                    (true, false) => {
+                        accumulate!(row_b, blk_x, |v| _mm256_permute4x64_epi64::<0x4E>(v))
+                    }
+                    (true, true) => {
+                        accumulate!(row_b, blk_x, |v| _mm256_permute4x64_epi64::<0x1B>(v))
+                    }
+                }
+            }
+        }
+    }
+
+    /// AVX-512 variant of `apply` for the production shape `ell == 64`: the
+    /// whole output lives in one zmm register, so each of the `n_chunks` table
+    /// rows costs a single load + `vpermq` + XOR, with one store at the end.
+    /// The qword permutation (out qword `j = 2c+o` reads src qword
+    /// `2(c^b_high) + (o^b_odd)`) subsumes both the chunk-index XOR and the
+    /// odd-`b` half-swap.
+    ///
+    /// # Safety
+    /// Caller must be on x86_64 with AVX512F. Validates slice lengths;
+    /// requires `ell == 64`.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    pub unsafe fn apply_avx512_unchecked(&self, bytes: &[u8], out: &mut [F8]) {
+        use core::arch::x86_64::*;
+        assert_eq!(bytes.len(), self.n_chunks);
+        assert_eq!(out.len(), self.ell);
+        assert_eq!(self.ell, 64);
+        let base = self.data.as_ptr() as *const u8;
+
+        unsafe {
+            let mut acc = _mm512_loadu_si512(base.add(bytes[0] as usize * 64) as *const _);
+            for b in 1..self.n_chunks {
+                let b_high = (b >> 1) as u64;
+                let b_odd = (b & 1) as u64;
+                let mut idx = [0u64; 8];
+                for (j, slot) in idx.iter_mut().enumerate() {
+                    let c = (j as u64) >> 1;
+                    let o = (j as u64) & 1;
+                    *slot = 2 * (c ^ b_high) + (o ^ b_odd);
+                }
+                let iv = _mm512_loadu_si512(idx.as_ptr() as *const _);
+                let row = _mm512_loadu_si512(base.add(bytes[b] as usize * 64) as *const _);
+                acc = _mm512_xor_si512(acc, _mm512_permutexvar_epi64(iv, row));
+            }
+            _mm512_storeu_si512(out.as_mut_ptr() as *mut _, acc);
         }
     }
 
@@ -321,6 +431,61 @@ mod tests {
                 assert_eq!(
                     out_scalar, out_neon,
                     "scalar/neon apply disagree at k={k}, bytes={:02x?}",
+                    bytes
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    #[test]
+    fn apply_avx512_matches_apply_scalar() {
+        let k = 6usize; // production shape: ell == 64
+        let ntt_s = AdditiveNttGf8::new(k, F8::ZERO);
+        let ntt_l = AdditiveNttGf8::new(k, F8(1u8 << k));
+        let table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        let ell = 1usize << k;
+        let mut rng = Rng::new(512 + k as u64);
+        for _ in 0..2048 {
+            let mut bytes = vec![0u8; table.n_chunks];
+            for x in bytes.iter_mut() {
+                *x = (rng.next_u64() & 0xff) as u8;
+            }
+            let mut out_scalar = vec![F8::ZERO; ell];
+            let mut out_512 = vec![F8::ZERO; ell];
+            table.apply_scalar(&bytes, &mut out_scalar);
+            unsafe { table.apply_avx512_unchecked(&bytes, &mut out_512) };
+            assert_eq!(
+                out_scalar, out_512,
+                "scalar/avx512 apply disagree, bytes={:02x?}",
+                bytes
+            );
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn apply_avx2_matches_apply_scalar() {
+        // Only k=6 (ell=64) satisfies ell % 32 == 0; also test k=... where ell mult of 32.
+        for k in [6usize] {
+            let ntt_s = AdditiveNttGf8::new(k, F8::ZERO);
+            let ntt_l = AdditiveNttGf8::new(k, F8(1u8 << k));
+            let table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+            let ell = 1usize << k;
+            let mut rng = Rng::new(200 + k as u64);
+            for _ in 0..2048 {
+                let mut bytes = vec![0u8; table.n_chunks];
+                for x in bytes.iter_mut() {
+                    *x = (rng.next_u64() & 0xff) as u8;
+                }
+                let mut out_scalar = vec![F8::ZERO; ell];
+                let mut out_avx2 = vec![F8::ZERO; ell];
+                table.apply_scalar(&bytes, &mut out_scalar);
+                unsafe { table.apply_avx2_unchecked(&bytes, &mut out_avx2) };
+                assert_eq!(
+                    out_scalar, out_avx2,
+                    "scalar/avx2 apply disagree at k={k}, bytes={:02x?}",
                     bytes
                 );
             }

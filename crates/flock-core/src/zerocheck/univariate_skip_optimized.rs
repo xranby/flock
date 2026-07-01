@@ -51,6 +51,62 @@ const N_CHUNKS: usize = 8;
 const N_INNER: usize = 7;
 const N_MEDIUM: usize = 4;
 
+/// x86 convert-table fold for the full (16 b_med) three-bank C case.
+/// Vector-native: the three F128 accumulators, the eq multiplier, and the
+/// destination `partial_*` entries (F128 is `repr(C, align(16))`) all stay in
+/// `__m128i`; the GHASH multiply is the 5-CLMUL Karatsuba kernel from the
+/// field module. Semantically identical to the scalar reference:
+///   partial_ab[l]  += (Σ_bmed convert[bmed*256 + ab[bmed][l]]) * eq_lo_val
+///   partial_c_0[l] += (Σ_bmed convert[bmed*256 + (c[bmed][l] & 0x55)]) * eq_lo_val
+///   partial_c_1[l] += (Σ_bmed convert[bmed*256 + (c[bmed][l] & 0xAA)]) * eq_lo_val
+#[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+#[inline]
+fn convert_fold_x86_full(
+    chunk_ab_bytes: &[[u8; 64]],
+    chunk_c_bytes: &[[u8; 64]],
+    convert: &[F128],
+    eq_lo_val: F128,
+    partial_ab: &mut [F128; ELL],
+    partial_c_0: &mut [F128; ELL],
+    partial_c_1: &mut [F128; ELL],
+) {
+    use crate::field::gf2_128::x86_64 as gf;
+    use core::arch::x86_64::*;
+    // convert entries are 16-byte aligned F128s at 16-byte strides.
+    let convert_ptr = convert.as_ptr() as *const __m128i;
+    unsafe {
+        let eqv = gf::to_m128(eq_lo_val); // hoisted: converted once per call
+        for lane in 0..ELL {
+            let mut cf_ab = _mm_setzero_si128();
+            let mut cf_c0 = _mm_setzero_si128();
+            let mut cf_c1 = _mm_setzero_si128();
+            for b_med in 0..(1 << N_MEDIUM) {
+                let v_ab = chunk_ab_bytes[b_med][lane] as usize;
+                let v_c = chunk_c_bytes[b_med][lane] as usize;
+                cf_ab = _mm_xor_si128(cf_ab, _mm_load_si128(convert_ptr.add(b_med * 256 + v_ab)));
+                cf_c0 = _mm_xor_si128(
+                    cf_c0,
+                    _mm_load_si128(convert_ptr.add(b_med * 256 + (v_c & 0x55))),
+                );
+                cf_c1 = _mm_xor_si128(
+                    cf_c1,
+                    _mm_load_si128(convert_ptr.add(b_med * 256 + (v_c & 0xAA))),
+                );
+            }
+            let ab = gf::mul_m128(cf_ab, eqv);
+            let c0 = gf::mul_m128(cf_c0, eqv);
+            let c1 = gf::mul_m128(cf_c1, eqv);
+            // F128 is repr(C, align(16)): update the partials with aligned ops.
+            let pa = partial_ab.as_mut_ptr().add(lane) as *mut __m128i;
+            let p0 = partial_c_0.as_mut_ptr().add(lane) as *mut __m128i;
+            let p1 = partial_c_1.as_mut_ptr().add(lane) as *mut __m128i;
+            _mm_store_si128(pa, _mm_xor_si128(_mm_load_si128(pa), ab));
+            _mm_store_si128(p0, _mm_xor_si128(_mm_load_si128(p0), c0));
+            _mm_store_si128(p1, _mm_xor_si128(_mm_load_si128(p1), c1));
+        }
+    }
+}
+
 /// The three small-eq challenges (as F_8 values, then embedded via φ_8).
 /// Choosing these specific values is what makes `eq_small[K] = C_s · α^K`.
 ///
@@ -256,7 +312,6 @@ unsafe fn bit_transpose_64bytes_neon(input: &[u8; 64], output: &mut [u8; 64]) {
         let mask3 = vdupq_n_u64(0x00000000F0F0F0F0);
 
         // Round 1: distance 7.
-        let t0 = vandq_u64(veorq_u64(y0, vshrq_n_u64::<7>(y0)), mask1);
         let t1 = vandq_u64(veorq_u64(y1, vshrq_n_u64::<7>(y1)), mask1);
         let t2 = vandq_u64(veorq_u64(y2, vshrq_n_u64::<7>(y2)), mask1);
         let t3 = vandq_u64(veorq_u64(y3, vshrq_n_u64::<7>(y3)), mask1);
@@ -266,7 +321,6 @@ unsafe fn bit_transpose_64bytes_neon(input: &[u8; 64], output: &mut [u8; 64]) {
         y3 = veorq_u64(y3, veorq_u64(t3, vshlq_n_u64::<7>(t3)));
 
         // Round 2: distance 14.
-        let t0 = vandq_u64(veorq_u64(y0, vshrq_n_u64::<14>(y0)), mask2);
         let t1 = vandq_u64(veorq_u64(y1, vshrq_n_u64::<14>(y1)), mask2);
         let t2 = vandq_u64(veorq_u64(y2, vshrq_n_u64::<14>(y2)), mask2);
         let t3 = vandq_u64(veorq_u64(y3, vshrq_n_u64::<14>(y3)), mask2);
@@ -276,7 +330,6 @@ unsafe fn bit_transpose_64bytes_neon(input: &[u8; 64], output: &mut [u8; 64]) {
         y3 = veorq_u64(y3, veorq_u64(t3, vshlq_n_u64::<14>(t3)));
 
         // Round 3: distance 28.
-        let t0 = vandq_u64(veorq_u64(y0, vshrq_n_u64::<28>(y0)), mask3);
         let t1 = vandq_u64(veorq_u64(y1, vshrq_n_u64::<28>(y1)), mask3);
         let t2 = vandq_u64(veorq_u64(y2, vshrq_n_u64::<28>(y2)), mask3);
         let t3 = vandq_u64(veorq_u64(y3, vshrq_n_u64::<28>(y3)), mask3);
@@ -293,15 +346,97 @@ unsafe fn bit_transpose_64bytes_neon(input: &[u8; 64], output: &mut [u8; 64]) {
     }
 }
 
+/// AVX2 64-byte bit-transpose. Gathers each b_chunk's 8 stride-8 input bytes
+/// into a u64, performs the 8x8 bit-transpose via three delta-swap rounds
+/// (distances 7, 14, 28 — same as the NEON path), and stores the 8 result
+/// bytes contiguously. All 8 groups processed as two __m256i (4 u64 lanes each).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+unsafe fn bit_transpose_64bytes_avx2(input: &[u8; 64], output: &mut [u8; 64]) {
+    use core::arch::x86_64::*;
+    unsafe {
+        // Gather: for each b_chunk in 0..8, build u64 whose byte x_small is
+        // input[x_small*8 + b_chunk]. That is the column b_chunk of the row-major
+        // 8x8 byte matrix `input`. Equivalent to a byte-transpose of the 8x8.
+        // We compute all 8 gathered u64s.
+        let mut g = [0u64; 8];
+        for x_small in 0..8 {
+            let row = u64::from_le_bytes([
+                input[x_small * 8],
+                input[x_small * 8 + 1],
+                input[x_small * 8 + 2],
+                input[x_small * 8 + 3],
+                input[x_small * 8 + 4],
+                input[x_small * 8 + 5],
+                input[x_small * 8 + 6],
+                input[x_small * 8 + 7],
+            ]);
+            // Scatter byte j of `row` into g[j]'s byte x_small.
+            for j in 0..8 {
+                let byte = (row >> (8 * j)) & 0xff;
+                g[j] |= byte << (8 * x_small);
+            }
+        }
+        // Now each g[b_chunk] holds, in byte x_small, the input byte
+        // input[x_small*8 + b_chunk]. An 8x8 bit-transpose of g[b_chunk]
+        // gives output bytes b_chunk*8 .. b_chunk*8+7.
+        let lo = _mm256_loadu_si256(g.as_ptr() as *const __m256i); // g[0..4]
+        let hi = _mm256_loadu_si256(g.as_ptr().add(4) as *const __m256i); // g[4..8]
+
+        #[inline(always)]
+        unsafe fn transpose8x8_x4(mut v: core::arch::x86_64::__m256i) -> core::arch::x86_64::__m256i {
+            use core::arch::x86_64::*;
+            unsafe {
+                let m1 = _mm256_set1_epi64x(0x00AA00AA00AA00AAu64 as i64);
+                let m2 = _mm256_set1_epi64x(0x0000CCCC0000CCCCu64 as i64);
+                let m3 = _mm256_set1_epi64x(0x00000000F0F0F0F0u64 as i64);
+                // Round 1: distance 7
+                let t = _mm256_and_si256(
+                    _mm256_xor_si256(v, _mm256_srli_epi64(v, 7)),
+                    m1,
+                );
+                v = _mm256_xor_si256(v, _mm256_xor_si256(t, _mm256_slli_epi64(t, 7)));
+                // Round 2: distance 14
+                let t = _mm256_and_si256(
+                    _mm256_xor_si256(v, _mm256_srli_epi64(v, 14)),
+                    m2,
+                );
+                v = _mm256_xor_si256(v, _mm256_xor_si256(t, _mm256_slli_epi64(t, 14)));
+                // Round 3: distance 28
+                let t = _mm256_and_si256(
+                    _mm256_xor_si256(v, _mm256_srli_epi64(v, 28)),
+                    m3,
+                );
+                v = _mm256_xor_si256(v, _mm256_xor_si256(t, _mm256_slli_epi64(t, 28)));
+                v
+            }
+        }
+
+        let ro = transpose8x8_x4(lo);
+        let rh = transpose8x8_x4(hi);
+        _mm256_storeu_si256(output.as_mut_ptr() as *mut __m256i, ro);
+        _mm256_storeu_si256(output.as_mut_ptr().add(32) as *mut __m256i, rh);
+    }
+}
+
 #[inline]
 pub fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
     #[cfg(target_arch = "aarch64")]
     // SAFETY: aarch64 statically guarantees NEON.
     unsafe {
-        bit_transpose_64bytes_neon(input, output)
+        bit_transpose_64bytes_neon(input, output);
+        return;
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    bit_transpose_64bytes_scalar(input, output);
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    // SAFETY: avx2 statically enabled via target-cpu=native.
+    unsafe {
+        bit_transpose_64bytes_avx2(input, output);
+        return;
+    }
+    #[allow(unreachable_code)]
+    {
+        bit_transpose_64bytes_scalar(input, output);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1147,7 +1282,22 @@ fn process_one_x_hi_with_s_hat_v(
                     state.partial_c_1[lane] += cf_c_1_f * eq_lo_val;
                 }
             }
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+            {
+                convert_fold_x86_full(
+                    &state.chunk_ab_bytes,
+                    &state.chunk_c_bytes,
+                    convert,
+                    eq_lo_val,
+                    &mut state.partial_ab,
+                    &mut state.partial_c_0,
+                    &mut state.partial_c_1,
+                );
+            }
+            #[cfg(not(any(
+                target_arch = "aarch64",
+                all(target_arch = "x86_64", target_feature = "pclmulqdq")
+            )))]
             {
                 for lane in 0..ELL {
                     let mut cf_ab = F128::ZERO;
@@ -1896,6 +2046,23 @@ mod tests {
                 dense_c, padded_c,
                 "C mismatch: k_log={k_log}, useful={useful_bits}, m={m}"
             );
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn avx2_bit_transpose_matches_scalar() {
+        let mut rng = Rng::new(0xB17_BB17);
+        for _ in 0..256 {
+            let mut input = [0u8; 64];
+            for byte in input.iter_mut() {
+                *byte = (rng.next_u64() & 0xff) as u8;
+            }
+            let mut out_scalar = [0u8; 64];
+            let mut out_avx2 = [0u8; 64];
+            bit_transpose_64bytes_scalar(&input, &mut out_scalar);
+            unsafe { bit_transpose_64bytes_avx2(&input, &mut out_avx2) };
+            assert_eq!(out_scalar, out_avx2, "avx2 bit_transpose disagreement");
         }
     }
 

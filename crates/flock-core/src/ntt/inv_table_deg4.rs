@@ -167,6 +167,12 @@ impl InvNttTableSToV8Gf8 {
             unsafe { self.apply_neon_unchecked(bytes, out) };
             return;
         }
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if self.ell_out >= 32 && self.ell_out % 32 == 0 {
+            // SAFETY: avx2 statically enabled via target-cpu=native; validates lengths.
+            unsafe { self.apply_avx2_unchecked(bytes, out) };
+            return;
+        }
         self.apply_scalar(bytes, out);
     }
 
@@ -212,6 +218,61 @@ impl InvNttTableSToV8Gf8 {
                         let v = vld1q_u8(row_b.add(sc * 16));
                         let dst = out_ptr.add(c * 16);
                         vst1q_u8(dst, veorq_u8(vld1q_u8(dst), v));
+                    }
+                }
+            }
+        }
+    }
+
+    /// AVX2 variant of `apply` — uniform 32-byte chunks with the permutation
+    /// folded into a single `vpermq` per block (see
+    /// `inv_table::apply_avx2_unchecked` for the derivation).
+    ///
+    /// # Safety
+    /// Caller must be on x86_64 with AVX2. Validates slice lengths;
+    /// requires `ell_out % 32 == 0`.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    pub unsafe fn apply_avx2_unchecked(&self, bytes: &[u8], out: &mut [F8]) {
+        use core::arch::x86_64::*;
+        assert_eq!(bytes.len(), self.n_chunks);
+        assert_eq!(out.len(), self.ell_out);
+        debug_assert_eq!(self.ell_out % 32, 0);
+        let n_blk = self.ell_out / 32;
+        let base = self.data.as_ptr() as *const u8;
+        let out_ptr = out.as_mut_ptr() as *mut u8;
+
+        unsafe {
+            let row0 = base.add(bytes[0] as usize * self.ell_out);
+            for blk in 0..n_blk {
+                let v = _mm256_loadu_si256(row0.add(blk * 32) as *const __m256i);
+                _mm256_storeu_si256(out_ptr.add(blk * 32) as *mut __m256i, v);
+            }
+
+            macro_rules! accumulate {
+                ($row:expr, $blk_x:expr, $perm:expr) => {
+                    for blk in 0..n_blk {
+                        let src = $row.add((blk ^ $blk_x) * 32) as *const __m256i;
+                        let v = $perm(_mm256_loadu_si256(src));
+                        let dst = out_ptr.add(blk * 32) as *mut __m256i;
+                        _mm256_storeu_si256(dst, _mm256_xor_si256(_mm256_loadu_si256(dst), v));
+                    }
+                };
+            }
+
+            for b in 1..self.n_chunks {
+                let b_high = b >> 1;
+                let row_b = base.add(bytes[b] as usize * self.ell_out);
+                let blk_x = b_high >> 1;
+                match ((b_high & 1) != 0, (b & 1) != 0) {
+                    (false, false) => accumulate!(row_b, blk_x, |v| v),
+                    (false, true) => {
+                        accumulate!(row_b, blk_x, |v| _mm256_permute4x64_epi64::<0xB1>(v))
+                    }
+                    (true, false) => {
+                        accumulate!(row_b, blk_x, |v| _mm256_permute4x64_epi64::<0x4E>(v))
+                    }
+                    (true, true) => {
+                        accumulate!(row_b, blk_x, |v| _mm256_permute4x64_epi64::<0x1B>(v))
                     }
                 }
             }

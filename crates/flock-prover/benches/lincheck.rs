@@ -2,6 +2,13 @@
 //! sparse base matrices, random claim points, dummy claim values) are
 //! hoisted outside the timed section — the prover doesn't check honesty
 //! against `v, v', v''` so dummy values are fine for benchmarking.
+//!
+//! `FOLD_AB=1` switches to an interleaved within-process A/B of the partial-fold
+//! kernel — the size-aware `default` dispatch (outer(tile)-partitioned `oblock`
+//! above the `n_log ≥ 16` guard, else `iblock`) vs forced `iblock` — per `m`, so
+//! thermal drift cancels. The fold is the bulk of `lincheck::prove`, so the `prove`
+//! delta isolates the kernel speedup. Expect ~1.0× below the guard (both iblock)
+//! and oblock's win above it (≈1.4–1.7× by m=28–29 at this k_log).
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -75,6 +82,7 @@ fn random_sparse_matrix(k: usize, nnz: usize, rng: &mut Rng) -> SparseBinaryMatr
 
 fn main() {
     let _ = flock_prover::init_perf_thread_pool();
+    let fold_ab = std::env::var("FOLD_AB").is_ok();
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     println!("(target: aarch64 + aes)");
     println!("k_log = {K_LOG}, k = {}", 1usize << K_LOG);
@@ -125,6 +133,45 @@ fn main() {
             let (z_packed, x_ab) = &witnesses[0];
             let mut ch = FsChallenger::new(b"flock-bench-v0");
             let _ = prove(z_packed, m, K_LOG, K_SKIP, &circuit, x_ab, &mut ch);
+        }
+
+        // Interleaved A/B: the size-aware default dispatch (oblock above the
+        // n_log≥16 guard, else iblock) vs forced iblock, per run so thermal drift
+        // cancels. Both produce a bit-identical proof (checksum confirms); the
+        // prove delta isolates the fold speedup where oblock engages.
+        if fold_ab {
+            use flock_prover::lincheck::FOLD_IBLOCK;
+            use std::sync::atomic::Ordering;
+            let (mut def_min, mut ib_min) = (f64::INFINITY, f64::INFINITY);
+            let mut cs = 0u64;
+            let ab_runs = n_runs.max(5);
+            for run in 0..ab_runs {
+                let (z_packed, x_ab) = &witnesses[(run % n_runs) + 1];
+
+                FOLD_IBLOCK.store(false, Ordering::Relaxed); // default (oblock if n_log≥16)
+                let mut ch = FsChallenger::new(b"flock-bench-v0");
+                let t0 = Instant::now();
+                let (p, c) = prove(black_box(z_packed), m, K_LOG, K_SKIP, &circuit, black_box(x_ab), &mut ch);
+                def_min = def_min.min(t0.elapsed().as_secs_f64() * 1000.0);
+                cs ^= p.z_partial[0].lo ^ c.w.lo;
+
+                FOLD_IBLOCK.store(true, Ordering::Relaxed); // forced iblock
+                let mut ch = FsChallenger::new(b"flock-bench-v0");
+                let t0 = Instant::now();
+                let (p, c) = prove(black_box(z_packed), m, K_LOG, K_SKIP, &circuit, black_box(x_ab), &mut ch);
+                ib_min = ib_min.min(t0.elapsed().as_secs_f64() * 1000.0);
+                cs ^= p.z_partial[0].lo ^ c.w.lo;
+            }
+            FOLD_IBLOCK.store(false, Ordering::Relaxed);
+            println!(
+                "  fold A/B: iblock {:>9.2} ms   default {:>9.2} ms   Δ {:+8.2} ms  (default {:.3}× faster)",
+                ib_min,
+                def_min,
+                ib_min - def_min,
+                ib_min / def_min,
+            );
+            println!("  checksum: {cs:016x}");
+            continue;
         }
 
         let mut best_ms = f64::INFINITY;

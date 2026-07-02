@@ -121,6 +121,16 @@ use crate::field::F128;
 use crate::r1cs::SparseBinaryMatrix;
 use crate::zerocheck::multilinear::lagrange_weights_naive;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::AtomicBool;
+
+/// Bench-only A/B toggle: when set, [`partial_fold_packed_z_best`] uses the legacy
+/// `i_inner`-partitioned `partial_fold_packed_z_neon_iblock_padded` instead of the
+/// default outer(tile)-partitioned `partial_fold_packed_z_neon_oblock_padded`. The
+/// two are bit-identical (GF(2¹²⁸) add is XOR — associative + commutative), so one
+/// process can time both back-to-back and cancel thermal drift. The oblock default
+/// builds each tile's sum-tables once instead of once per worker, scaling the fold
+/// ~8.5× vs iblock's ~6.5× on 10 P-cores at m=32. See `benches/lincheck.rs` (FOLD_AB=1).
+pub static FOLD_IBLOCK: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // LincheckCircuit: the per-block linear structure lincheck consumes
@@ -936,6 +946,114 @@ pub fn partial_fold_packed_z_neon_iblock_padded(
     out
 }
 
+/// Outer(tile)-partitioned sibling of [`partial_fold_packed_z_neon_iblock_padded`]
+/// — same result, parallelized to remove the redundant per-worker sum-table
+/// rebuilds that cap iblock's multicore scaling. **This is the default fold**
+/// (`partial_fold_packed_z_best`); set [`FOLD_IBLOCK`] to fall back to iblock.
+///
+/// iblock partitions the length-k **output** across workers, so every worker
+/// rebuilds **all** `n_stripes` tile tables — table work is done `p`× and does not
+/// shrink with cores (≈44 % of the MT wall at m=32). Here we partition the **tiles**
+/// (outer/stripe dim): each worker owns a contiguous tile band, builds each of its
+/// tile tables exactly **once**, folds them into a private length-k partial, and the
+/// `p` partials are XOR-reduced at the end. The partial is the full length-k
+/// (256 KB at k_log=14 ⇒ spills L1 to L2), but the register-tiled inner kernel keeps
+/// 8 F128 accumulators in NEON registers, so the L2 traffic is mild — measured ≈2 %
+/// ST cost at m=32, none at m=30 — and far cheaper than iblock's redundant tables:
+/// the fold scales ~8.5× vs iblock's ~6.5× on 10 P-cores at m=32, and the margin
+/// grows with the outer dim (the redundant-table cost it removes is ∝ `n_stripes`).
+///
+/// # Safety / preconditions: identical to the iblock kernel.
+#[cfg(target_arch = "aarch64")]
+pub fn partial_fold_packed_z_neon_oblock_padded(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    use rayon::prelude::*;
+
+    const TILE_T: usize = NEON_TILE_T;
+    const BLOCK_K: usize = 8;
+
+    let n_log = m - k_log;
+    let k = 1usize << k_log;
+    let n_outer = 1usize << n_log;
+    assert_eq!(z_packed.len(), (1usize << m) / 8);
+    assert_eq!(eq_outer.len(), n_outer);
+    assert!(
+        n_log >= 3 + TILE_T.trailing_zeros() as usize,
+        "need n_outer ≥ 8·TILE_T stripes"
+    );
+    assert!(k_log >= 3, "need k ≥ 8");
+    assert!(useful_bits <= k);
+    let n_stripes = n_outer / 8;
+    assert_eq!(n_stripes % TILE_T, 0);
+    assert_eq!(k % BLOCK_K, 0);
+    let n_tiles = n_stripes / TILE_T;
+
+    // Only i_inner < useful_bits can be nonzero (padded rows fold to 0). Rounded
+    // up to BLOCK_K; columns [useful, k) stay zero from the partial init.
+    let useful = (useful_bits.div_ceil(BLOCK_K) * BLOCK_K).min(k);
+    if useful == 0 {
+        return vec![F128::ZERO; k];
+    }
+
+    // One private length-k partial per worker; workers own contiguous tile bands,
+    // so each tile's sum-tables are built exactly once (not once per worker).
+    let p = rayon::current_num_threads().max(1);
+    let tiles_per_worker = n_tiles.div_ceil(p);
+    let n_workers = n_tiles.div_ceil(tiles_per_worker); // ≤ p, every band non-empty
+
+    let mut partials = vec![F128::ZERO; n_workers * k];
+    partials
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(w, partial)| {
+            let tile_lo = w * tiles_per_worker;
+            let tile_hi = ((w + 1) * tiles_per_worker).min(n_tiles);
+            // TILE_T × 256 F128 = 32 KB tables, L1-resident, built once per tile.
+            let mut tables = vec![F128::ZERO; TILE_T * 256];
+            for tile in tile_lo..tile_hi {
+                let stripe_base = tile * TILE_T;
+                for t in 0..TILE_T {
+                    let eq_off = 8 * (stripe_base + t);
+                    build_sum_table(
+                        &eq_outer[eq_off..eq_off + 8],
+                        &mut tables[t * 256..(t + 1) * 256],
+                    );
+                }
+                let tables_ptr = tables.as_ptr() as *const u8;
+                let z_base = unsafe { z_packed.as_ptr().add(stripe_base * k) };
+                let mut bs = 0usize;
+                while bs < useful {
+                    unsafe {
+                        process_block_neon_single(
+                            z_base,
+                            k,
+                            bs,
+                            tables_ptr,
+                            partial.as_mut_ptr().add(bs),
+                        );
+                    }
+                    bs += BLOCK_K;
+                }
+            }
+        });
+
+    // XOR-reduce the per-worker partials: parallel over columns, sequential over
+    // workers so each 256 KB partial is streamed once (cache-friendly).
+    let (first, rest) = partials.split_at(k);
+    let mut out = first.to_vec();
+    for chunk in rest.chunks(k) {
+        out.par_iter_mut()
+            .zip(chunk.par_iter())
+            .for_each(|(o, s)| *o += *s);
+    }
+    out
+}
+
 /// Dispatch helper: pick the fastest single-matrix partial fold available
 /// for the given (m, k_log). Threads `useful_bits` through so the kernel
 /// can skip blocks past the useful region of each block (byte-identical to
@@ -950,10 +1068,22 @@ fn partial_fold_packed_z_best(
     if n_log_ok_for_tile(m, k_log, NEON_TILE_T) {
         #[cfg(target_arch = "aarch64")]
         {
-            // i_inner-partitioned: keeps the length-k accumulator L2-resident so
-            // the fold scales with cores instead of saturating on memory
-            // bandwidth (~1.8× the stripe-parallel kernel at m=30, ~8.8× scaling
-            // on 10 P-cores vs ~4.8×). See `partial_fold_packed_z_neon_iblock_padded`.
+            // Pick the partition that wins for this size. The outer(tile)-partitioned
+            // `oblock` builds each tile's sum-tables once instead of once per worker,
+            // so it scales the fold far better (≈8.5× vs iblock's ≈6.5× on 10 P-cores
+            // at m=32) — BUT its private-partial alloc + XOR-reduce overhead makes it
+            // up to ~1.7× SLOWER on small folds. Empirically (M4 Max, 10 P-cores) the
+            // crossover sits at n_log ≈ 15–16 across k_log ∈ {11,14}, so gate oblock at
+            // n_log ≥ 16; below that the L1-resident `iblock` wins. `FOLD_IBLOCK` forces
+            // iblock everywhere (bench A/B).
+            let n_log = m - k_log;
+            if n_log >= OBLOCK_MIN_N_LOG
+                && !FOLD_IBLOCK.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return partial_fold_packed_z_neon_oblock_padded(
+                    z_packed, m, k_log, useful_bits, eq_outer,
+                );
+            }
             partial_fold_packed_z_neon_iblock_padded(z_packed, m, k_log, useful_bits, eq_outer)
         }
         #[cfg(not(target_arch = "aarch64"))]
@@ -964,6 +1094,12 @@ fn partial_fold_packed_z_best(
         partial_fold_packed_z_fast_padded(z_packed, m, k_log, useful_bits, eq_outer)
     }
 }
+
+/// Outer-dimension threshold (`n_log = m − k_log`) at/above which the
+/// outer(tile)-partitioned fold beats the i_inner-partitioned one. See
+/// [`partial_fold_packed_z_best`] for the crossover calibration.
+#[cfg(target_arch = "aarch64")]
+const OBLOCK_MIN_N_LOG: usize = 16;
 
 /// Quick test for "can we use the tiled fast path?". Tile uses `TILE_T`
 /// stripes; we need `n_stripes` divisible by TILE_T and enough outer dim.
@@ -2057,6 +2193,44 @@ mod tests {
             let iblock =
                 partial_fold_packed_z_neon_iblock_padded(&z_packed, m, k_log, 1usize << k_log, &eq);
             assert_eq!(serial, iblock, "iblock at m={m}, k_log={k_log}");
+        }
+    }
+
+    /// The default outer(tile)-partitioned fold is **bit-identical** to the legacy
+    /// i_inner-partitioned iblock kernel — dense (useful=k) and padded (useful<k,
+    /// including a non-byte-aligned shape) across tile-eligible sizes. GF(2¹²⁸) add
+    /// is XOR (associative + commutative), so the two partition strategies must
+    /// produce the exact same length-k vector.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn partial_fold_oblock_matches_iblock() {
+        // (m, k_log, useful_bits); mix of dense and padded, all tile-eligible.
+        let cases: &[(usize, usize, usize)] = &[
+            (14, 4, 1 << 4),   // dense, small k
+            (16, 8, 1 << 8),   // dense
+            (18, 10, 1 << 10), // dense
+            (20, 10, 597),     // padded, non-byte-aligned
+            (22, 14, 15_409),  // padded, non-byte-aligned (k=16384)
+        ];
+        for &(m, k_log, useful_bits) in cases {
+            assert!(n_log_ok_for_tile(m, k_log, NEON_TILE_T), "case must be tile-eligible");
+            let k = 1usize << k_log;
+            let n_log = m - k_log;
+            let n_blocks = 1usize << n_log;
+            let mut rng = Rng::new(7200 + (m * 31 + k_log) as u64);
+            let mut z = rng.bits(1 << m);
+            // Honest padding: zero rows [useful, k) of every block.
+            for blk in 0..n_blocks {
+                for j in useful_bits..k {
+                    z[blk * k + j] = false;
+                }
+            }
+            let z_packed = pack_z_lincheck(&z, m, k_log);
+            let eq = build_eq_table(&rng.f128_vec(n_log));
+            let want =
+                partial_fold_packed_z_neon_iblock_padded(&z_packed, m, k_log, useful_bits, &eq);
+            let got = partial_fold_packed_z_neon_oblock_padded(&z_packed, m, k_log, useful_bits, &eq);
+            assert_eq!(want, got, "m={m} k_log={k_log} useful={useful_bits}");
         }
     }
 

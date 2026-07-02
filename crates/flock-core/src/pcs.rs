@@ -532,16 +532,22 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     //      BaseFold round-0 prime (u_0, u_2 over packed_witness · b_combined).
     let mut b_combined: Vec<F128> = crate::scratch::take_f128(l);
 
-    // Fast path (compression-proof open: claims ab, c): every RS claim is a
-    // fused DeferredDense fold and there are no packed-direct claims. Fold all
-    // claims block-by-block straight into b_combined — each claim's `e_hi`
-    // hoisted once per block, exactly as in `fold_b128_elems_split` — and fuse
-    // the round-0 prime in the same pass. Neither the per-claim `γ_k·B_k` buffer
-    // nor a combine readback is ever materialized (saves ~2·L writes + 2·L reads
-    // of the 2^(m-7) basis).
-    let use_fast = packed_direct.is_empty()
-        && !rs_deferred.is_empty()
-        && rs_deferred.len() == rs_results.len();
+    // Fast path (compression-proof open: claims ab, c; also chain/merkle): every
+    // RS claim is a fused DeferredDense fold and no DENSE packed-direct claim
+    // needs the per-element combine. Fold all claims block-by-block straight into
+    // b_combined — each claim's `e_hi` hoisted once per block, exactly as in
+    // `fold_b128_elems_split` — and fuse the round-0 prime in the same pass.
+    // Neither the per-claim `γ_k·B_k` buffer nor a combine readback is ever
+    // materialized (saves ~2·L writes + 2·L reads of the 2^(m-7) basis).
+    //
+    // SPARSE packed-direct claims (the chain/merkle I/O claim) do NOT disable
+    // this path: they're scatter-added onto b_combined after the fold (with an
+    // incremental round-0 prime adjustment), so they only require
+    // `pd_dense.is_empty()`, not `packed_direct.is_empty()`. This keeps the two
+    // big ab/c claims on the fused fold instead of materializing them.
+    let use_fast = !rs_deferred.is_empty()
+        && rs_deferred.len() == rs_results.len()
+        && pd_dense.is_empty();
 
     let (mut round0_u0, mut round0_u2) = if use_fast {
         let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
@@ -649,21 +655,15 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     }
     for (pd, g) in packed_direct.iter().zip(gammas_pd.iter()) {
         if let DirectEqInd::Sparse(eq) = &pd.eq_ind {
-            sparse_scatter_add_parallel(&mut b_combined, eq, *g);
-            let (u0_fix, u2_fix) = b_combined
-                .par_chunks(2)
-                .enumerate()
-                .map(|(i, chunk)| {
-                    let a0 = packed_witness[2 * i];
-                    let a1 = packed_witness[2 * i + 1];
-                    (a0 * chunk[0], (a0 + a1) * (chunk[0] + chunk[1]))
-                })
-                .reduce(
-                    || (F128::ZERO, F128::ZERO),
-                    |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
-                );
-            round0_u0 = u0_fix;
-            round0_u2 = u2_fix;
+            // Scatter-add the sparse claim and fold its round-0 prime
+            // contribution in the SAME pass (O(live positions)), instead of a
+            // full O(L) re-pass over b_combined. The prime is linear in
+            // b_combined, so the delta from scattering `g·eq` equals
+            // Σ adjust_prime_for_delta(idx, g·val) over the live positions.
+            let (du0, du2) =
+                sparse_scatter_add_parallel(&mut b_combined, packed_witness, eq, *g);
+            round0_u0 += du0;
+            round0_u2 += du2;
         }
     }
     if trace {
@@ -700,12 +700,24 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
 /// range of `b_combined`. Splits `b_combined` at the chunk boundaries via
 /// `split_at_mut`, then writes scatter-adds into the disjoint mutable slices —
 /// safe rust, no atomics.
-fn sparse_scatter_add_parallel(b_combined: &mut [F128], eq: &SparseEqTensor, gamma: F128) {
+/// Scatter-add `gamma · eq` into `b_combined` and return the resulting BaseFold
+/// round-0 prime delta `(Δu0, Δu2)`. Because the prime is linear in
+/// `b_combined`, adding `delta = gamma·val` at index `idx` changes the prime by
+/// `Δu0 += a0·delta` (if `idx` even) and `Δu2 += (a0+a1)·delta`, where
+/// `a0 = packed_witness[2·pair]`, `a1 = packed_witness[2·pair+1]`,
+/// `pair = idx/2`. Computing it here (O(live positions)) avoids a full O(L)
+/// re-pass over `b_combined` at the call site.
+fn sparse_scatter_add_parallel(
+    b_combined: &mut [F128],
+    packed_witness: &[F128],
+    eq: &SparseEqTensor,
+    gamma: F128,
+) -> (F128, F128) {
     use rayon::prelude::*;
 
     let c_total = eq.live_tensor.len();
     if c_total == 0 {
-        return;
+        return (F128::ZERO, F128::ZERO);
     }
     let n_threads = rayon::current_num_threads().max(1);
     let c_per_chunk = c_total.div_ceil(n_threads).max(1);
@@ -741,16 +753,35 @@ fn sparse_scatter_add_parallel(b_combined: &mut [F128], eq: &SparseEqTensor, gam
     slices.push(remaining);
     debug_assert_eq!(slices.len(), actual_n_chunks);
 
-    slices.into_par_iter().enumerate().for_each(|(t, slice)| {
-        let c_lo = t * c_per_chunk;
-        let c_hi = ((t + 1) * c_per_chunk).min(c_total);
-        let b_lo = b_boundaries[t];
-        for c in c_lo..c_hi {
-            let val = eq.live_tensor[c];
-            let idx = eq.scatter_idx(c);
-            slice[idx - b_lo] += gamma * val;
-        }
-    });
+    slices
+        .into_par_iter()
+        .enumerate()
+        .map(|(t, slice)| {
+            let c_lo = t * c_per_chunk;
+            let c_hi = ((t + 1) * c_per_chunk).min(c_total);
+            let b_lo = b_boundaries[t];
+            let mut du0 = F128::ZERO;
+            let mut du2 = F128::ZERO;
+            for c in c_lo..c_hi {
+                let val = eq.live_tensor[c];
+                let idx = eq.scatter_idx(c);
+                let delta = gamma * val;
+                slice[idx - b_lo] += delta;
+                // Round-0 prime delta for this scattered position.
+                let pair = idx / 2;
+                let a0 = packed_witness[2 * pair];
+                let a1 = packed_witness[2 * pair + 1];
+                if idx & 1 == 0 {
+                    du0 += a0 * delta;
+                }
+                du2 += (a0 + a1) * delta;
+            }
+            (du0, du2)
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+        )
 }
 
 /// Verify a batched opening produced by [`open_batch`]. Each `(claim, z_skip,

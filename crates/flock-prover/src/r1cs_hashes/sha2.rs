@@ -1716,7 +1716,9 @@ impl Sha256HybridSetup {
 // Merkle path: SHA-256 geometry + thin wrappers over the generic Merkle core.
 // ───────────────────────────────────────────────────────────────────────────
 
-pub use super::merkle_path_common::{MerklePathProof, MerklePathVerifyError};
+pub use super::merkle_path_common::{
+    MerklePathProof, MerklePathProofLigerito, MerklePathVerifyError,
+};
 
 /// SHA-256's 4-slot geometry for the Merkle-path protocol. The block starts
 /// with four 256-bit slots in order:
@@ -1923,6 +1925,177 @@ impl Sha256HybridSetup {
             &root_phys,
             b_bits,
             self.r1cs.csc_lincheck_circuit(),
+            challenger,
+        )
+    }
+
+    /// Ligerito-backend mirror of [`Self::prove_merkle_path`]. Same protocol;
+    /// the final PCS open routes through Ligerito (smaller proof). Requires a
+    /// registered Ligerito security config for this `m` (m ≥ 22).
+    pub fn prove_merkle_path_ligerito<Ch: flock_core::challenger::Challenger>(
+        &self,
+        compressions: &[Compression],
+        b_bits: &[bool],
+        challenger: &mut Ch,
+    ) -> (MerklePathProofLigerito, flock_core::pcs::Commitment) {
+        assert_eq!(compressions.len(), self.n_compressions);
+        assert_eq!(
+            self.n_compressions,
+            self.n_block_slots(),
+            "prove_merkle_path_ligerito requires n_compressions to exactly fill \
+             n_block_slots (no padding); got n_compressions={}, \
+             n_block_slots={}. Use a power-of-2 ≥ 8.",
+            self.n_compressions,
+            self.n_block_slots(),
+        );
+        assert_eq!(
+            b_bits.len(),
+            self.n_block_slots(),
+            "bit vector length mismatch"
+        );
+        let (z_packed, a_packed, b_packed, z_lincheck) =
+            generate_witness_with_ab_packed_and_lincheck(compressions, self.n_blocks_log());
+        super::merkle_path_common::prove_merkle_paths_ligerito_generic(
+            &self.r1cs,
+            &self.pcs_params,
+            &MERKLE_LAYOUT,
+            0, // path_log: single-path
+            z_packed,
+            a_packed,
+            b_packed,
+            z_lincheck,
+            b_bits,
+            self.r1cs.csc_lincheck_circuit(),
+            challenger,
+        )
+    }
+
+    /// Ligerito-backend mirror of [`Self::verify_merkle_path`].
+    pub fn verify_merkle_path_ligerito<Ch: flock_core::challenger::Challenger>(
+        &self,
+        commitment: &flock_core::pcs::Commitment,
+        proof: &MerklePathProofLigerito,
+        leaf: &[u32; 8],
+        root: &[u32; 8],
+        b_bits: &[bool],
+        challenger: &mut Ch,
+    ) -> Result<(), MerklePathVerifyError> {
+        assert_eq!(
+            self.n_compressions,
+            self.n_block_slots(),
+            "verify_merkle_path_ligerito requires n_compressions to exactly fill \
+             n_block_slots (no padding)",
+        );
+        assert_eq!(
+            b_bits.len(),
+            self.n_block_slots(),
+            "bit vector length mismatch"
+        );
+        let n_log = self.n_blocks_log();
+        let leaf_phys = hash_to_phys_bits(leaf);
+        let root_phys = hash_to_phys_bits(root);
+        super::merkle_path_common::verify_merkle_paths_ligerito_generic(
+            &self.r1cs,
+            &MERKLE_LAYOUT,
+            0, // path_log: single-path
+            commitment,
+            proof,
+            n_log,
+            &[leaf_phys.as_slice()],
+            &root_phys,
+            b_bits,
+            self.r1cs.csc_lincheck_circuit(),
+            &self.pcs_params,
+            challenger,
+        )
+    }
+
+    /// Ligerito-backend mirror of [`Self::prove_merkle_paths`].
+    pub fn prove_merkle_paths_ligerito<Ch: flock_core::challenger::Challenger>(
+        &self,
+        path_log: usize,
+        compressions: &[Compression],
+        b_bits: &[bool],
+        challenger: &mut Ch,
+    ) -> (MerklePathProofLigerito, flock_core::pcs::Commitment) {
+        assert_eq!(compressions.len(), self.n_compressions);
+        assert_eq!(
+            self.n_compressions,
+            self.n_block_slots(),
+            "prove_merkle_paths_ligerito requires n_compressions to exactly fill \
+             n_block_slots (no padding); got n_compressions={}, \
+             n_block_slots={}. Use a power-of-2 ≥ 8.",
+            self.n_compressions,
+            self.n_block_slots(),
+        );
+        assert_eq!(
+            b_bits.len(),
+            self.n_block_slots(),
+            "bit vector length mismatch"
+        );
+        assert!(
+            path_log <= self.n_blocks_log(),
+            "path_log {} > n_blocks_log {}",
+            path_log,
+            self.n_blocks_log(),
+        );
+        let (z_packed, a_packed, b_packed, z_lincheck) =
+            generate_witness_with_ab_packed_and_lincheck(compressions, self.n_blocks_log());
+        super::merkle_path_common::prove_merkle_paths_ligerito_generic(
+            &self.r1cs,
+            &self.pcs_params,
+            &MERKLE_LAYOUT,
+            path_log,
+            z_packed,
+            a_packed,
+            b_packed,
+            z_lincheck,
+            b_bits,
+            self.r1cs.csc_lincheck_circuit(),
+            challenger,
+        )
+    }
+
+    /// Ligerito-backend mirror of [`Self::verify_merkle_paths`].
+    pub fn verify_merkle_paths_ligerito<Ch: flock_core::challenger::Challenger>(
+        &self,
+        path_log: usize,
+        commitment: &flock_core::pcs::Commitment,
+        proof: &MerklePathProofLigerito,
+        leaves: &[[u32; 8]],
+        root: &[u32; 8],
+        b_bits: &[bool],
+        challenger: &mut Ch,
+    ) -> Result<(), MerklePathVerifyError> {
+        assert_eq!(
+            self.n_compressions,
+            self.n_block_slots(),
+            "verify_merkle_paths_ligerito requires n_compressions to exactly fill \
+             n_block_slots (no padding)",
+        );
+        assert_eq!(
+            b_bits.len(),
+            self.n_block_slots(),
+            "bit vector length mismatch"
+        );
+        let n_paths = 1usize << path_log;
+        assert_eq!(leaves.len(), n_paths, "leaves must have length 2^path_log");
+        let n_log = self.n_blocks_log();
+        let leaves_phys: Vec<Vec<bool>> = leaves.iter().map(hash_to_phys_bits).collect();
+        let leaves_phys_refs: Vec<&[bool]> = leaves_phys.iter().map(|v| v.as_slice()).collect();
+        let root_phys = hash_to_phys_bits(root);
+        super::merkle_path_common::verify_merkle_paths_ligerito_generic(
+            &self.r1cs,
+            &MERKLE_LAYOUT,
+            path_log,
+            commitment,
+            proof,
+            n_log,
+            &leaves_phys_refs,
+            &root_phys,
+            b_bits,
+            self.r1cs.csc_lincheck_circuit(),
+            &self.pcs_params,
             challenger,
         )
     }
@@ -2516,6 +2689,35 @@ mod tests {
         setup
             .verify_merkle_paths(2, &commitment, &proof, &leaves, &root, &b, &mut chv)
             .expect("honest 4-path proof must verify");
+    }
+
+    #[test]
+    fn prove_merkle_path_ligerito_roundtrip() {
+        use flock_core::challenger::FsChallenger;
+        // n=128 → m=22 with K_LOG=15 (smallest m with a Ligerito config).
+        let setup = Sha256HybridSetup::new(128);
+        let (blocks, leaf, root, b) = honest_merkle_path(setup.n_compressions, 0x5EED_F00D);
+        let mut ch = FsChallenger::new(b"sha2-merkle-lig");
+        let (proof, commitment) = setup.prove_merkle_path_ligerito(&blocks, &b, &mut ch);
+        let mut chv = FsChallenger::new(b"sha2-merkle-lig");
+        setup
+            .verify_merkle_path_ligerito(&commitment, &proof, &leaf, &root, &b, &mut chv)
+            .expect("ligerito merkle path must verify");
+    }
+
+    #[test]
+    fn prove_merkle_paths_ligerito_roundtrip_p2() {
+        use flock_core::challenger::FsChallenger;
+        // path_log=1 → P=2 paths of length 64 = 128 total → m=22.
+        let setup = Sha256HybridSetup::new(128);
+        let (blocks, leaves, root, b) =
+            honest_merkle_paths_identical(setup.n_compressions, 1, 0xC0DE_BABE);
+        let mut ch = FsChallenger::new(b"sha2-merkle-paths-lig");
+        let (proof, commitment) = setup.prove_merkle_paths_ligerito(1, &blocks, &b, &mut ch);
+        let mut chv = FsChallenger::new(b"sha2-merkle-paths-lig");
+        setup
+            .verify_merkle_paths_ligerito(1, &commitment, &proof, &leaves, &root, &b, &mut chv)
+            .expect("ligerito 2-path proof must verify");
     }
 
     #[test]

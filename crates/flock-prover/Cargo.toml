@@ -106,6 +106,14 @@ name = "blake3_lig_vs_bf"
 harness = false
 
 [[bench]]
+name = "blake3_chain_lig_vs_bf"
+harness = false
+
+[[bench]]
+name = "sha2_merkle_lig_vs_bf"
+harness = false
+
+[[bench]]
 name = "blake3_fast_vs_slim"
 harness = false
 
